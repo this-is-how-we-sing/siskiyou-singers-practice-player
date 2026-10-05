@@ -1,0 +1,2033 @@
+---
+// One song row for the rehearsal list, for pieces we only have as RECORDED AUDIO
+// (WAV/m4a) rather than MIDI — e.g. O Christmas Tree. It mirrors MidiPractice's
+// look and controls exactly (Play/Reset/Loop/skip/tempo/mixer/score view) but
+// plays the files through the Web Audio API instead of synthesizing MIDI. The
+// engine is ported from the spring2026 recorded-audio mixer: one shared
+// AudioContext, per-part GainNodes, SoundTouch pitch-preserving slow-down, and
+// an <audio>-element fallback on iOS (Web Audio routes to the earpiece there).
+//
+// STYLING NOTE: the `.pp-*` CSS classes used here are defined `is:global` by
+// MidiPractice.astro. Both components always render together on the members
+// page (src/pages/members/index.astro), so the styles are present. If you ever
+// use AudioPractice on a page WITHOUT MidiPractice, port the CSS too.
+interface Part { file: string; label: string }
+interface NoteData {
+  bpm: number;
+  beatsPerBar: number;
+  pickupBeats: number;
+  measures: number;
+  totalBeats: number;
+  parts: Record<string, [number, number, number][]>;
+}
+interface Props {
+  title: string;
+  composer?: string;
+  desc?: string;
+  pdf?: string | null;
+  youtube?: string;
+  /** Our own learning page, shown where the YouTube button goes. See Score.guide. */
+  guide?: { href: string; label: string };
+  prefix: string;
+  basePath: string;
+  parts: Part[];
+  sheetPdf?: string;
+  /**
+   * Score tempo in quarter-note beats per minute, and beats per bar. Recorded
+   * audio carries no tempo information the way a MIDI file does, so a metronome
+   * has nowhere to get a pulse from unless we state it. Read these off the score.
+   * Omit them and the metronome button simply isn't rendered — better than a
+   * button that clicks at the wrong speed.
+   */
+  bpm?: number;
+  beatsPerBar?: number;
+  /**
+   * Per-part notes read off the recording by scripts/extract-audio-notes.mjs.
+   * With it the player draws the same pitch lanes and note readouts a MIDI song
+   * gets. Without it those two pieces are simply left out and everything else
+   * still works.
+   */
+  notes?: NoteData;
+}
+const { title, composer, desc, pdf, youtube, guide, prefix, basePath, parts, sheetPdf, bpm, beatsPerBar, notes } = Astro.props;
+const config = JSON.stringify({
+  basePath, parts, sheetPdf, title,
+  bpm: bpm ?? notes?.bpm ?? null,
+  beatsPerBar: beatsPerBar ?? notes?.beatsPerBar ?? 4,
+  pickupBeats: notes?.pickupBeats ?? 0,
+  measures: notes?.measures ?? 0,
+  notes: notes?.parts ?? null,
+});
+// A recorded track only has measures if the score's tempo was written down.
+// Without one the loop still works, but in seconds: the two boxes hold times
+// and the steppers are hidden, because a measure is not a unit this song has.
+// The same test the script makes as `hasGrid`, made here so the markup can be
+// labelled before the script runs.
+const hasGridServer = Number(bpm ?? notes?.bpm ?? 0) > 0;
+// Panel markup is emitted as a static string (IDs are wired at runtime). It is
+// MidiPractice's panel, element for element, so the two kinds of row look and
+// behave the same. The one piece still missing is the follow-the-soprano dot on
+// the score, which needs the note-to-page map only a MusicXML file carries.
+const panelInner = `          <div class="rounded-xl ring-1 ring-white/10 bg-black/40 p-4 md:p-5">
+            <div id="${prefix}-loading" class="flex items-center gap-2 text-base text-zinc-300 mb-2">
+              <span class="note-spin" aria-hidden="true">🎵</span>
+              <span id="${prefix}-loading-text">Loading…</span>
+            </div>
+
+            <div id="${prefix}-transport" class="hidden flex flex-col gap-2 mb-4">
+              <div class="pp-deck flex items-center gap-2 flex-wrap justify-between">
+                <div class="flex items-center gap-2 flex-wrap">
+                <button id="${prefix}-play" class="pp-ctrl-btn pp-play-btn" aria-label="Play">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="pp-icon-play w-5 h-5 shrink-0"><path d="M6.3 2.84A1.5 1.5 0 0 0 4 4.11v11.78a1.5 1.5 0 0 0 2.3 1.27l9.344-5.891a1.5 1.5 0 0 0 0-2.538L6.3 2.841Z"/></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="pp-icon-pause w-5 h-5 shrink-0"><path d="M5.75 3a.75.75 0 0 0-.75.75v12.5c0 .414.336.75.75.75h1.5a.75.75 0 0 0 .75-.75V3.75A.75.75 0 0 0 7.25 3h-1.5ZM12.75 3a.75.75 0 0 0-.75.75v12.5c0 .414.336.75.75.75h1.5a.75.75 0 0 0 .75-.75V3.75a.75.75 0 0 0-.75-.75h-1.5Z"/></svg>
+                </button>
+                <button id="${prefix}-stop" class="pp-ctrl-btn" aria-label="Reset to start">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="w-4 h-4 shrink-0"><path fill-rule="evenodd" d="M15.312 11.424a5.5 5.5 0 0 1-9.201 2.466l-.312-.311h2.433a.75.75 0 0 0 0-1.5H3.989a.75.75 0 0 0-.75.75v4.242a.75.75 0 0 0 1.5 0v-2.43l.31.31a7 7 0 0 0 11.712-3.138.75.75 0 0 0-1.449-.39Zm1.23-3.723a.75.75 0 0 0 .219-.53V2.929a.75.75 0 0 0-1.5 0V5.36l-.31-.31A7 7 0 0 0 3.239 8.188a.75.75 0 1 0 1.448.389A5.5 5.5 0 0 1 13.89 6.11l.311.31h-2.432a.75.75 0 0 0 0 1.5h4.243a.75.75 0 0 0 .53-.219Z" clip-rule="evenodd"/></svg>
+                  <span class="pp-btn-word">Reset</span>
+                </button>
+                <button id="${prefix}-loop" class="pp-icon-btn pp-punch-btn" aria-label="Loop from here" title="Press where the passage starts, then again where it ends">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="w-4 h-4 shrink-0"><path fill-rule="evenodd" d="M10 4.5c1.215 0 2.417.055 3.604.162a.68.68 0 0 1 .615.597c.124 1.038.208 2.088.25 3.15l-1.689-1.69a.75.75 0 0 0-1.06 1.061l2.999 3a.75.75 0 0 0 1.06 0l3.001-3a.75.75 0 1 0-1.06-1.06l-1.748 1.747a41.31 41.31 0 0 0-.264-3.386 2.18 2.18 0 0 0-1.97-1.913 41.512 41.512 0 0 0-7.477 0 2.18 2.18 0 0 0-1.969 1.913 41.16 41.16 0 0 0-.16 1.61.75.75 0 1 0 1.495.12c.041-.52.093-1.038.154-1.552a.68.68 0 0 1 .615-.597A40.012 40.012 0 0 1 10 4.5ZM5.281 9.22a.75.75 0 0 0-1.06 0l-3.001 3a.75.75 0 1 0 1.06 1.06l1.748-1.747c.042 1.141.13 2.27.264 3.386a2.18 2.18 0 0 0 1.97 1.913 41.533 41.533 0 0 0 7.477 0 2.18 2.18 0 0 0 1.969-1.913c.064-.534.117-1.071.16-1.61a.75.75 0 1 0-1.495-.12c-.041.52-.093 1.037-.154 1.552a.68.68 0 0 1-.615.597 40.013 40.013 0 0 1-7.208 0 .68.68 0 0 1-.615-.597 39.785 39.785 0 0 1-.25-3.15l1.689 1.69a.75.75 0 0 0 1.06-1.061l-2.999-3Z" clip-rule="evenodd"/></svg>
+                  <span id="${prefix}-loop-label" class="pp-btn-word">Loop</span>
+                </button>
+                <button id="${prefix}-skip-back" class="pp-icon-btn" aria-label="Back 15 seconds" title="Back 15s"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="w-4 h-4 shrink-0"><path d="M7.712 4.818A1.5 1.5 0 0 1 10 6.095v2.972c.104-.13.234-.248.389-.343l6.323-3.906A1.5 1.5 0 0 1 19 6.095v7.81a1.5 1.5 0 0 1-2.288 1.276l-6.323-3.905a1.505 1.505 0 0 1-.389-.344v2.973a1.5 1.5 0 0 1-2.288 1.276l-6.323-3.905a1.5 1.5 0 0 1 0-2.552l6.323-3.906Z"/></svg><span>15s</span></button>
+                <button id="${prefix}-skip-fwd" class="pp-icon-btn" aria-label="Forward 15 seconds" title="Forward 15s"><span>15s</span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="w-4 h-4 shrink-0"><path d="M3.288 4.818A1.5 1.5 0 0 0 1 6.095v7.81a1.5 1.5 0 0 0 2.288 1.276l6.323-3.905c.155-.096.285-.213.389-.344v2.973a1.5 1.5 0 0 0 2.288 1.276l6.323-3.905a1.5 1.5 0 0 0 0-2.552l-6.323-3.906A1.5 1.5 0 0 0 10 6.095v2.972a1.506 1.506 0 0 0-.389-.343L3.288 4.818Z"/></svg></button>
+                </div>
+                ${bpm ? `<div class="pp-metro-group">
+                  <button id="${prefix}-metronome" class="pp-metronome-btn" aria-label="Toggle metronome" aria-pressed="false" title="Metronome (${bpm} bpm, from the score)">
+                    <span>Metronome</span>
+                  </button>
+                  <div id="${prefix}-metro-vol" class="pp-metro-vol"></div>
+                </div>` : ''}
+                <div class="pp-tempo-group">
+                  <span class="pp-tempo-label">Tempo</span>
+                  <div class="pp-tempo-widget">
+                  <div class="pp-tempo-controls">
+                    <div id="${prefix}-tempo-steps" class="pp-tempo-steps" role="group" aria-label="Tempo">
+                      <button class="pp-tempo-step" data-rate="0.50" aria-label="50 percent">50<span class="pp-step-pct">%</span></button>
+                      <button class="pp-tempo-step" data-rate="0.60" aria-label="60 percent">60<span class="pp-step-pct">%</span></button>
+                      <button class="pp-tempo-step" data-rate="0.70" aria-label="70 percent">70<span class="pp-step-pct">%</span></button>
+                      <button class="pp-tempo-step" data-rate="0.80" aria-label="80 percent">80<span class="pp-step-pct">%</span></button>
+                      <button class="pp-tempo-step" data-rate="0.90" aria-label="90 percent">90<span class="pp-step-pct">%</span></button>
+                      <button class="pp-tempo-step is-active" data-rate="1.00" aria-label="100 percent">100<span class="pp-step-pct">%</span></button>
+                    </div>
+                    <button id="${prefix}-tempo-reset" class="pp-tempo-reset-btn" title="Reset tempo and volumes">↺</button>
+                  </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="flex items-center gap-2">
+                <span id="${prefix}-time" class="pp-time-readout tabular-nums">0:00 / 0:00</span>
+                <div class="flex-1 min-w-0">
+                  <div id="${prefix}-progress-track" class="pp-progress-track" role="progressbar" aria-label="Playback position by measure" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                    <div id="${prefix}-loop-region" class="pp-loop-region" style="display:none"></div>
+                    <div id="${prefix}-measures" class="pp-measure-ticks" aria-hidden="true"></div>
+                    <div id="${prefix}-progress-fill" class="pp-progress-fill"></div>
+                    <div id="${prefix}-head" class="pp-head"></div>
+                    <div id="${prefix}-loop-start-mk" class="pp-loop-marker pp-loop-mk-start" style="display:none" title="Drag to set loop start" aria-hidden="true"></div>
+                    <div id="${prefix}-loop-end-mk" class="pp-loop-marker pp-loop-mk-end" style="display:none" title="Drag to set loop end" aria-hidden="true"></div>
+                  </div>
+                </div>
+                <span id="${prefix}-measure" class="pp-measure-readout text-base font-semibold tabular-nums text-yellow-200 text-right">m. —</span>
+              </div>
+
+              <div class="pp-info-row">
+                <div class="pp-info-left">
+                  <p id="${prefix}-status" class="pp-status"></p>
+                </div>
+                <div id="${prefix}-loop-bar" class="pp-loop-bar" style="display:none">
+                  <span id="${prefix}-loop-armed" class="pp-loop-armed" style="display:none">
+                    <span class="pp-loop-pip" aria-hidden="true"></span>
+                    <span id="${prefix}-loop-armed-text" role="status">Loop starts here</span>
+                    <button id="${prefix}-loop-cancel" class="pp-loop-off-btn">Cancel</button>
+                  </span>
+                  <span id="${prefix}-loop-steps" class="pp-loop-steps" style="display:none">
+                    <span class="pp-edge">
+                      <span class="pp-edge-label">${hasGridServer ? 'from m.' : 'from'}</span>
+                      <span class="pp-stepper">
+                        <button class="pp-step-btn" data-edge="start" data-delta="-1" aria-label="Loop start one measure earlier">&#8722;</button>
+                        <input id="${prefix}-loop-start" type="text" class="pp-step-val pp-time-start" value="${hasGridServer ? '1' : '0:00'}" aria-label="Loop start">
+                        <button class="pp-step-btn" data-edge="start" data-delta="1" aria-label="Loop start one measure later">+</button>
+                      </span>
+                    </span>
+                    <span class="pp-edge">
+                      <span class="pp-edge-label">${hasGridServer ? 'to m.' : 'to'}</span>
+                      <span class="pp-stepper">
+                        <button class="pp-step-btn" data-edge="end" data-delta="-1" aria-label="Loop end one measure earlier">&#8722;</button>
+                        <input id="${prefix}-loop-end" type="text" class="pp-step-val pp-time-end" value="${hasGridServer ? '1' : '0:00'}" aria-label="Loop end, inclusive">
+                        <button class="pp-step-btn" data-edge="end" data-delta="1" aria-label="Loop end one measure later">+</button>
+                      </span>
+                    </span>
+                    <span class="pp-loop-summary">
+                      <span id="${prefix}-loop-measures" class="pp-loop-clock">1 bar</span>
+                      <button id="${prefix}-loop-help" class="pp-loop-help-btn" aria-label="How looping works" title="How looping works">?</button>
+                      <button id="${prefix}-loop-off" class="pp-loop-off-btn">Loop off</button>
+                    </span>
+                  </span>
+                </div>
+                <div class="pp-info-right">
+                  <button id="${prefix}-egg" class="pp-egg-btn" title="Saloon mode" aria-label="Play slowed down">🤠</button>
+                </div>
+              </div>
+              <div id="${prefix}-waveview" class="pp-waveview"></div>
+            </div>
+
+            <div id="${prefix}-tracks" class="hidden pp-mixer"></div>
+
+            <div class="pp-bottom-actions">
+              <button id="${prefix}-sheet-toggle" class="pp-sheet-toggle-btn" style="display:none" aria-expanded="false">📄 Score</button>
+              <button id="${prefix}-export" class="pp-export-btn" title="Save these settings as an MP3 file">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="w-4 h-4 shrink-0"><path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.955 3.129V2.75Z"/><path d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z"/></svg>
+                <span>Download Mix</span>
+              </button>
+            </div>
+            <p id="${prefix}-export-status" class="pp-export-status" role="status" hidden></p>
+            <div id="${prefix}-sheet-section" class="pp-sheet-section" style="display:none">
+              <div class="pp-sheet-nav">
+                <button id="${prefix}-sheet-prev" class="pp-sheet-btn">← Prev</button>
+                <span id="${prefix}-sheet-page" class="pp-sheet-page-info">Page 1 / 1</span>
+                <button id="${prefix}-sheet-next" class="pp-sheet-btn">Next →</button>
+              </div>
+              <div class="pp-sheet-canvas-wrap">
+                <canvas id="${prefix}-sheet-canvas" class="pp-sheet-canvas"></canvas>
+                <div id="${prefix}-sheet-loading" class="pp-sheet-loading hidden">Loading score…</div>
+              </div>
+            </div>
+          </div>`;
+---
+
+<li class="audio-practice flex flex-col" data-prefix={prefix} data-audio-config={config}>
+  <!-- The title and composer get the full card width, and the buttons take the
+       line under them, until the card is 1280px wide. An iPad is 768-1194px in
+       either orientation, and at those widths three buttons on the right left
+       the title a narrow column that broke a long song name across two lines. -->
+  <div class="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
+    <div class="song-meta flex-1">
+      <div class="song-titleblock">
+        <p class="song-title font-medium">{title}</p>
+        {composer && <p class="song-translation">{composer}</p>}
+      </div>
+      {desc && <p class="song-desc">{desc}</p>}
+    </div>
+    <div class="flex flex-wrap gap-2 md:gap-3 items-center">
+      {pdf ? (
+        <a
+          aria-label={`Download ${title} sheet music PDF — opens in new tab`}
+          href={pdf}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="action-btn pdf-btn"
+        >🎵 <span class="hidden sm:inline">Sheet Music (PDF)</span><span class="inline sm:hidden">PDF</span></a>
+      ) : (
+        <span class="text-xs text-zinc-400 italic self-center">PDF coming soon</span>
+      )}
+      {youtube && (
+        <a
+          aria-label={`Watch a reference recording of ${title} on YouTube — opens in new tab`}
+          href={youtube}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="action-btn yt-btn"
+        >▶️ <span>YouTube</span></a>
+      )}
+      {guide && (
+        <a
+          aria-label={`${title}: ${guide.label} guide`}
+          href={guide.href}
+          class="action-btn guide-btn"
+        >🗣️ <span>{guide.label}</span></a>
+      )}
+      <button
+        id={`${prefix}-toggle`}
+        class="action-btn practice-btn"
+        aria-expanded="false"
+        aria-controls={`${prefix}-panel`}
+      >🎹 <span class="hidden sm:inline">Practice</span><span class="pp-chevron ml-1" aria-hidden="true">▾</span></button>
+    </div>
+  </div>
+  <div id={`${prefix}-panel`} hidden class="px-3 pb-3 md:px-4 md:pb-4" set:html={panelInner} />
+</li>
+
+<script>
+  import { openLoopHowTo, loopHowToDismissed } from '../lib/loop-howto';
+  import { registerSpaceToPlay } from '../lib/space-to-play';
+  // === Recorded-audio per-part mixer. Engine ported from the spring2026 audio
+  // player (Web Audio buffers, per-part GainNodes, SoundTouch pitch-preserving
+  // slow-down, iOS <audio> fallback). UI/CSS classes are shared with
+  // MidiPractice, so this looks and behaves identically to the MIDI players. ===
+
+
+  // The Feedback button is position:fixed, so it floats over whichever player
+  // is open and nothing inside a player can reach it with a selector. This
+  // puts the fact on the body instead, and FeedbackWidget.astro reads it: on a
+  // phone the button steps aside while a player is open, and comes back when
+  // the player closes. Counted rather than set, because closing one row and
+  // opening another fires both hooks.
+  function markBodyPracticing() {
+    const open = document.querySelector('li.is-practicing');
+    document.body.classList.toggle('ss-practicing', !!open);
+  }
+
+  // Shared AudioContext — one per page keeps resources low.
+  let sharedCtx: AudioContext | null = null;
+  function getCtx(): AudioContext { return sharedCtx || (sharedCtx = new AudioContext()); }
+  // The feedback form's "Sound:" line, as in MidiPractice.astro.
+  (window as any).__ppAudioSound = () => (sharedCtx ? String(sharedCtx.state) : 'not started');
+
+  // iOS/Chrome mobile: the AudioContext must be physically started inside the
+  // synchronous part of a user-gesture handler (before any await) to unlock.
+  function unlockAudio() {
+    const ctx = getCtx();
+    ctx.resume().catch(() => {});
+    if (ctx.state !== 'running') {
+      try {
+        const src = ctx.createBufferSource();
+        src.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+        src.connect(ctx.destination); src.start(0);
+      } catch {}
+    }
+  }
+
+  // SoundTouch AudioWorklet — pitch-preserving time stretch, loaded on demand.
+  let _stMod: any = null;
+  async function loadSoundTouch() {
+    if (!_stMod) {
+      const mod: any = await import('@soundtouchjs/audio-worklet');
+      _stMod = mod.SoundTouchNode ? mod : (mod.default || mod);
+    }
+    const audio: any = getCtx();
+    if (!audio._stWorkletLoaded) {
+      await audio.audioWorklet.addModule('/soundtouch-processor.js');
+      audio._stWorkletLoaded = true;
+    }
+  }
+
+  // Accordion: when one player opens, the others close. Shared with
+  // MidiPractice via the window, since both kinds of row share one list.
+  const allPlayerClosers: Array<() => void> =
+    ((window as any).__ssPracticeClosers ||= []);
+
+  // Shared with MidiPractice: the rehearsal schedule looks a player up here by
+  // prefix to loop a measure range.
+  const practiceJumps: Record<string, (from: number, to: number) => Promise<void>> =
+    ((window as any).__ssPracticeJumps ||= {});
+
+  function parseRgba(c) {
+    const m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    return m ? [+m[1], +m[2], +m[3]] : [180, 180, 180];
+  }
+
+  function makeAudioPlayer(prefix, song) {
+    const $ = id => document.getElementById(`${prefix}-${id}`);
+    const toggleBtn = $('toggle'), panel = $('panel');
+    const loadingEl = $('loading'), loadingTx = $('loading-text');
+    const transportEl = $('transport');
+    const playBtn = $('play'), stopBtn = $('stop'), tempoSteps = $('tempo-steps');
+    const skipBackBtn = $('skip-back'), skipFwdBtn = $('skip-fwd');
+    const loopBtn = $('loop'), loopBar = $('loop-bar');
+    const metroBtn = $('metronome'); // null when the song has no score tempo
+    const metroVolEl = $('metro-vol');
+    const loopStartEl = $('loop-start'), loopEndEl = $('loop-end');
+    const loopLabel = $('loop-label'), loopShort = $('loop-short');
+    const loopArmedEl = $('loop-armed'), loopArmedText = $('loop-armed-text');
+    const loopStepsEl = $('loop-steps'), loopMeasuresEl = $('loop-measures');
+    const loopOffBtn = $('loop-off'), loopCancelBtn = $('loop-cancel');
+    const loopHelpBtn = $('loop-help');
+    const stepBtns = loopBar ? Array.from(loopBar.querySelectorAll('.pp-step-btn')) : [];
+    const loopRegion = $('loop-region'), loopStartMk = $('loop-start-mk'), loopEndMk = $('loop-end-mk');
+    const tempoResetBtn = $('tempo-reset'), eggBtn = $('egg');
+    const trackEl = $('progress-track'), fillEl = $('progress-fill'), headEl = $('head');
+    const timeEl = $('time'), measureEl = $('measure'), ticksEl = $('measures');
+    const tracksEl = $('tracks'), statusEl = $('status'), waveviewEl = $('waveview');
+    const exportBtn = $('export'), exportStatus = $('export-status');
+    const sheetToggle = $('sheet-toggle'), sheetSection = $('sheet-section');
+    const sheetPrev = $('sheet-prev'), sheetNext = $('sheet-next'), sheetPageInfo = $('sheet-page');
+    const sheetCanvas = $('sheet-canvas'), sheetLoading = $('sheet-loading');
+    if (!toggleBtn || !panel) return;
+
+    // Two-column layout when the score opens (controls sidebar + score).
+    const innerEl = panel.firstElementChild;
+    const controlsWrap = document.createElement('div');
+    controlsWrap.className = 'pp-controls-wrap';
+    while (innerEl.firstChild && innerEl.firstChild !== sheetSection) {
+      controlsWrap.appendChild(innerEl.firstChild);
+    }
+    innerEl.insertBefore(controlsWrap, sheetSection);
+
+    // Floating page-turn arrows over the score, forwarding to the real nav
+    // buttons so the paging logic stays in one place. Ported from MidiPractice.
+    const pageArrows = document.createElement('div');
+    pageArrows.className = 'pp-page-arrows';
+    const arrow = (cls, glyph, label, src) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pp-page-arrow ' + cls;
+      b.innerHTML = glyph;
+      b.setAttribute('aria-label', label);
+      b.addEventListener('click', () => src.click());
+      return b;
+    };
+    const arrowPrev = arrow('pp-page-prev', '&#8249;', 'Previous page', sheetPrev);
+    const arrowNext = arrow('pp-page-next', '&#8250;', 'Next page', sheetNext);
+    pageArrows.append(arrowPrev, arrowNext);
+    sheetSection.insertBefore(pageArrows, sheetSection.firstChild);
+    const syncArrows = () => {
+      arrowPrev.disabled = sheetPrev.disabled;
+      arrowNext.disabled = sheetNext.disabled;
+    };
+    syncArrows();
+
+    // Sticky mini-transport, shown only in single-column score mode, because the
+    // real deck is off-screen while you are reading. Its buttons forward to the
+    // real ones and its icons are cloned from them, so the two cannot drift.
+    const miniStrip = document.createElement('div');
+    miniStrip.className = 'pp-mini-transport';
+    const miniBtn = (src, cls) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = cls;
+      b.innerHTML = src.innerHTML;
+      b.setAttribute('aria-label', src.getAttribute('aria-label') || '');
+      b.addEventListener('click', () => src.click());
+      return b;
+    };
+    const miniBack = miniBtn(skipBackBtn, 'pp-icon-btn');
+    const miniPlay = miniBtn(playBtn, 'pp-ctrl-btn pp-play-btn');
+    const miniFwd = miniBtn(skipFwdBtn, 'pp-icon-btn');
+    const miniMeasure = document.createElement('span');
+    miniMeasure.className = 'pp-mini-measure';
+    miniMeasure.setAttribute('aria-hidden', 'true');
+    miniMeasure.textContent = 'm. —';
+    const miniHide = document.createElement('button');
+    miniHide.type = 'button';
+    miniHide.className = 'pp-mini-hide';
+    miniHide.textContent = 'Hide score';
+    miniHide.setAttribute('aria-label', 'Hide the score');
+    miniHide.addEventListener('click', () => sheetToggle.click());
+    miniStrip.append(miniBack, miniPlay, miniFwd, miniMeasure, miniHide);
+    innerEl.appendChild(miniStrip);
+
+    // Stand the strip down whenever the real deck is on screen, or it sits on
+    // top of a second copy of the same buttons. An observer rather than a
+    // scroll handler: the deck can also come into view because the layout
+    // changed, with no scrolling involved.
+    const deckEl = panel.querySelector('.pp-deck');
+    const setStripRedundant = on => miniStrip.classList.toggle('is-redundant', on);
+    if (deckEl && 'IntersectionObserver' in window) {
+      new IntersectionObserver(
+        entries => setStripRedundant(entries.some(e => e.isIntersecting)),
+        { threshold: 0 },
+      ).observe(deckEl);
+    } else if (deckEl) {
+      const r = deckEl.getBoundingClientRect();
+      setStripRedundant(r.top < window.innerHeight && r.bottom > 0);
+    }
+
+    const resourceList = panel.closest('.resource-list');
+    const rowEl = panel.closest('li');
+
+    // Collapsing an already-open player above this row pulls the page up and the
+    // clicked row jumps away. Hold the button still: measure, mutate, scroll back.
+    function keepRowInPlace(mutate) {
+      const before = toggleBtn.getBoundingClientRect().top;
+      mutate();
+      const after = toggleBtn.getBoundingClientRect().top;
+      if (after !== before) window.scrollBy(0, after - before);
+    }
+
+    // Transport.seconds can sit a hair below zero at rest, which floored to
+    // "-1:-1" on the readout. Clamp before formatting.
+    const fmt = s => { const n = Math.max(0, Number(s) || 0);
+      return `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, '0')}`; };
+    const parseTime = s => {
+      const parts = (s || '').trim().split(':').map(p => parseFloat(p) || 0);
+      return parts.length >= 2 ? parts[0] * 60 + parts[1] : parts[0];
+    };
+    const SNAP_PTS = [0, 25, 50, 75, 100];
+    const snapVol = v => { for (const s of SNAP_PTS) { if (Math.abs(v - s) <= 4) return s; } return v; };
+    const COLORS = ['rgba(45,212,191,0.95)', 'rgba(56,189,248,0.95)', 'rgba(251,191,36,0.95)',
+      'rgba(244,114,182,0.95)', 'rgba(167,139,250,0.95)', 'rgba(251,146,60,0.95)'];
+
+    const isMobile = navigator.maxTouchPoints > 1;
+    let buffers = [], gainNodes = [], sources = [], audioEls = [];
+    let levels = [], enabled = [];
+    let duration = 0, isPlaying = false, pauseOffset = 0, startedAt = 0, rafId = null;
+    let playbackRate = 1, stTimers = [];
+    // Bumped by every play/pause/stop/teardown. play() is async (it may await the
+    // SoundTouch worklet), and it *assigns* `sources` when it finishes. Without
+    // this, a second play() — from a fast tempo click or a loop wrap landing in
+    // that await — would overwrite `sources` and leave the first batch of nodes
+    // playing with no reference left to stop them. That was the stutter that
+    // only a page reload could clear, because reloading was the only thing that
+    // tore down the AudioContext. Any play() whose generation is stale now bails
+    // out instead of clobbering the live sources.
+    let playGen = 0;
+    // True while the current sources are routed through SoundTouch, so a tempo
+    // change knows whether it can adjust the running nodes or has to rebuild.
+    let stActive = false;
+    let loopEnabled = false, loopStart = 0, loopEnd = 0;
+    // The middle state of the loop button: a start is marked and the player is
+    // waiting for the press that says where the passage ends. Nothing repeats
+    // while this is true, so the music carries on and the end is marked by ear.
+    let punchArmed = false;
+    let focusedTrack = null, focusMode = null, savedLevels = []; // 'solo' ducks others to 18% | 'iso' mutes others
+    let loaded = false;
+    let focusBtns = [], isoBtns = [], trackRows = [];
+    let knobs = [], checkboxEls = [];
+    let waveCanvases = [], noteNowEls = [];
+    // Saloon mode: the same half-speed easter egg the MIDI players have.
+    let eggActive = false;
+
+    // ---- The score's beat grid ----
+    // Recorded audio has no tempo track, so the grid comes from the printed
+    // score (bpm + beats per bar + how many beats of pickup come before measure
+    // 1). These recordings are sequenced at a fixed tempo, so a constant grid is
+    // exact: every bar line in O Christmas Tree lands within 30 ms of the
+    // matching attack in the audio. A song whose recording breathes — a real
+    // choir with rubato — would drift, and then it should not set `bpm` at all.
+    const SCORE_BPM = Number(song.bpm) || 0;
+    const BEATS_PER_BAR = Math.max(1, Number(song.beatsPerBar) || 4);
+    const PICKUP_BEATS = Math.max(0, Number(song.pickupBeats) || 0);
+    const SEC_PER_BEAT = SCORE_BPM ? 60 / SCORE_BPM : 0;
+    const hasGrid = SEC_PER_BEAT > 0;
+    let totalMeasures = Number(song.measures) || 0;
+    // Per-part note lanes: { notes: [{sb, eb, midi, nm}], lo, hi } or null.
+    let vizParts = [];
+    const WINDOW_BEATS = 16, WAVE_PLAYHEAD_FRAC = 0.2;
+
+    // Seconds <-> beats, both measured from the first sample of the file.
+    const secToBeat = sec => (hasGrid ? sec / SEC_PER_BEAT : 0);
+    const beatToSec = b => b * SEC_PER_BEAT;
+    // Where measure m (1-based) begins, in seconds.
+    const barStartSec = m => beatToSec(PICKUP_BEATS + (m - 1) * BEATS_PER_BAR);
+    // The measure a moment falls in, 1-based. Anything before the downbeat of
+    // measure 1 is the pickup, which reads as measure 1 rather than 0 — that is
+    // the bar singers are counting into.
+    const measureAt = sec => {
+      if (!hasGrid) return 1;
+      const b = secToBeat(sec) - PICKUP_BEATS;
+      if (b < 0) return 1;
+      return Math.min(totalMeasures || Infinity, Math.floor(b / BEATS_PER_BAR) + 1);
+    };
+    // Beat within the bar, 1-based.
+    const beatAt = sec => {
+      if (!hasGrid) return 1;
+      const b = secToBeat(sec) - PICKUP_BEATS;
+      if (b < 0) return Math.floor(BEATS_PER_BAR + b) + 1;
+      return Math.floor(b % BEATS_PER_BAR) + 1;
+    };
+
+    const NOTE_NAMES_FLAT = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
+    const noteName = m => NOTE_NAMES_FLAT[m % 12] + (Math.floor(m / 12) - 1);
+    // Score view (manual paging; no note-sync for recorded audio)
+    let pdfDoc = null, displayedPage = -1, renderScale = 1, pdfRendering = false;
+    // A render in flight used to make renderPage() return silently, so a second
+    // page-turn tap during the ~200ms render just vanished. targetPage tracks where
+    // the reader is heading (displayedPage is stale mid-render, and -1 while one is
+    // forced), and queuedPage keeps the last request so it runs when the current
+    // render finishes. Latest wins: three fast taps land on the third page, not the
+    // first one that happened to win the race.
+    let targetPage = 1, queuedPage = null;
+
+    function closePlayer() {
+      if (panel.hidden) return;
+      if (sheetSection && sheetSection.style.display !== 'none') {
+        sheetSection.style.display = 'none';
+        innerEl.classList.remove('pp-score-open');
+        if (resourceList) resourceList.classList.add('overflow-hidden');
+        if (sheetToggle) { sheetToggle.textContent = '📄 Score'; sheetToggle.setAttribute('aria-expanded', 'false'); }
+      }
+      if (isPlaying) fadeAndPause();
+      panel.hidden = true;
+      if (rowEl) rowEl.classList.remove('is-practicing');
+      markBodyPracticing();
+      toggleBtn.setAttribute('aria-expanded', 'false');
+      toggleBtn.querySelector('.pp-chevron').textContent = '▾';
+    }
+    allPlayerClosers.push(closePlayer);
+
+    // Expand this row (collapsing whichever was open) and load the audio once.
+    async function openPlayer() {
+      if (!panel.hidden) return;
+      keepRowInPlace(() => {
+        allPlayerClosers.forEach(fn => fn !== closePlayer && fn());
+        panel.hidden = false;
+      });
+      if (rowEl) rowEl.classList.add('is-practicing');
+      markBodyPracticing();
+      toggleBtn.setAttribute('aria-expanded', 'true');
+      toggleBtn.querySelector('.pp-chevron').textContent = '▴';
+      try { await getCtx().resume(); } catch {}
+      if (!loaded) await loadTracks();
+    }
+
+    toggleBtn.addEventListener('click', async () => {
+      unlockAudio(); // synchronous, before any await, to unlock on iOS/Chrome mobile
+      if (!panel.hidden) { closePlayer(); return; }
+      await openPlayer();
+    });
+
+    async function loadTracks() {
+      loadingEl.classList.remove('hidden');
+      const audio = getCtx();
+      try {
+        let n = 0;
+        buffers = await Promise.all(song.parts.map(async p => {
+          const r = await fetch(song.basePath + '/' + encodeURIComponent(p.file));
+          if (!r.ok) throw new Error(p.file);
+          const buf = await audio.decodeAudioData(await r.arrayBuffer());
+          loadingTx.textContent = `Loading… ${++n}/${song.parts.length}`;
+          return buf;
+        }));
+      } catch (e) {
+        loadingTx.textContent = 'Could not load audio: ' + e.message;
+        console.error('[audio] load failed', e);
+        return;
+      }
+      duration = Math.max(...buffers.map(b => b.duration));
+      // The loop bar stays hidden until a loop exists, so nothing is written
+      // to the boxes here; renderLoopUI fills them the moment one is punched in.
+      loopEnd = duration;
+      levels = buffers.map(() => 0.8);
+      enabled = buffers.map(() => true);
+      gainNodes = buffers.map(() => {
+        const g = audio.createGain(); g.gain.value = 0.8; g.connect(audio.destination); return g;
+      });
+
+      // On mobile, play through <audio> elements routed to the same GainNodes
+      // (iOS sends raw Web Audio buffer output to the earpiece; it ignores
+      // audioEl.volume, so the GainNode is the only per-part volume control).
+      if (isMobile) {
+        audioEls = song.parts.map((p, idx) => {
+          const el = new Audio(song.basePath + '/' + encodeURIComponent(p.file));
+          el.preload = 'auto';
+          audio.createMediaElementSource(el).connect(gainNodes[idx]);
+          return el;
+        });
+      }
+
+      buildViz();
+      buildTracks();
+      buildMeasures();
+      if (!isMobile) loadSoundTouch().catch(() => {}); // pre-fetch so first tempo change is instant
+      loaded = true;
+      loadingEl.classList.add('hidden');
+      transportEl.classList.remove('hidden');
+      tracksEl.classList.remove('hidden');
+      if (song.sheetPdf && sheetToggle) sheetToggle.style.display = '';
+      updateLoopMarkers();
+      draw(0);
+      // The lanes are sized from the element's own width, so a window that
+      // changes width leaves them stretched by CSS until something redraws.
+      window.addEventListener('resize', () => drawWave(currentPos()));
+      // The clock at the left of the progress bar prints the length now, so
+      // this line does not repeat it.
+      statusEl.textContent = hasGrid
+        ? `${totalMeasures} measures · ${BEATS_PER_BAR}/4 time · ♩ = ${SCORE_BPM}`
+        : `${song.parts.length} parts`;
+    }
+
+    // ---- Note lanes ----
+    // The MIDI players read their lanes straight out of the file. These notes
+    // were recovered from the recording instead (scripts/extract-audio-notes.mjs),
+    // and they describe what the singer is actually hearing, which is the useful
+    // thing whether or not the recording agrees with the page in front of them.
+    function buildViz() {
+      vizParts = song.parts.map(p => {
+        const raw = song.notes && song.notes[p.label];
+        if (!raw || !raw.length) return null;
+        let lo = 127, hi = 0;
+        const notes = raw.map(([midi, sb, eb]) => {
+          if (midi < lo) lo = midi;
+          if (midi > hi) hi = midi;
+          return { sb, eb, midi, nm: noteName(midi) };
+        });
+        return { notes, lo: lo - 1, hi: hi + 1 };
+      });
+      // Nothing to draw for any part: leave the lanes out altogether rather than
+      // showing four empty strips.
+      if (vizParts.every(v => !v)) vizParts = [];
+      // A measure count was not given, so take it from the recording's length.
+      if (hasGrid && !totalMeasures) {
+        totalMeasures = Math.max(1, Math.ceil((secToBeat(duration) - PICKUP_BEATS) / BEATS_PER_BAR));
+      }
+    }
+
+    // Bar lines on the scrub track, same as the MIDI player's. No numbers: the
+    // strip is too narrow for them, and the readout beside it names the one
+    // measure anybody wants.
+    function buildMeasures() {
+      if (!ticksEl) return;
+      ticksEl.innerHTML = '';
+      if (!hasGrid || !totalMeasures || !duration) {
+        if (measureEl) measureEl.style.display = 'none';
+        // With no measures to show, the time is the readout, so give it the
+        // weight the measure readout would have had.
+        if (timeEl) timeEl.className = 'text-base tabular-nums text-yellow-200 text-right';
+        return;
+      }
+      const majorEvery = totalMeasures > 40 ? 10 : (totalMeasures > 16 ? 5 : 2);
+      for (let m = 1; m <= totalMeasures; m++) {
+        const at = barStartSec(m);
+        if (at >= duration) break;
+        const tk = document.createElement('div');
+        tk.className = 'tk' + ((m - 1) % majorEvery === 0 ? ' major' : '');
+        tk.style.left = (at / duration * 100) + '%';
+        ticksEl.appendChild(tk);
+      }
+    }
+
+    // Rotary volume knob — drag/wheel/arrow keys, keyboard-accessible.
+    function makeKnob(label, initialPct, onInput) {
+      const NS = 'http://www.w3.org/2000/svg';
+      const root = document.createElement('div');
+      root.className = 'pp-knob';
+      root.setAttribute('role', 'slider');
+      root.tabIndex = 0;
+      root.setAttribute('aria-label', `Volume for ${label}`);
+      root.setAttribute('aria-valuemin', '0');
+      root.setAttribute('aria-valuemax', '100');
+      const svg = document.createElementNS(NS, 'svg');
+      svg.setAttribute('viewBox', '0 0 40 40'); svg.setAttribute('class', 'pp-knob-svg');
+      svg.setAttribute('aria-hidden', 'true');
+      // 270 degree gauge with the gap at the bottom. R is pulled in from 15 so
+      // the r=6.5 grip still lands inside the 40-unit viewBox.
+      const KNOB_R = 13.5, KNOB_SPAN = 270, KNOB_START = -135;
+      const C = 2 * Math.PI * KNOB_R, ARC = 0.75 * C;
+      const circle = (cls, r) => {
+        const c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', '20'); c.setAttribute('cy', '20'); c.setAttribute('r', String(r));
+        c.setAttribute('class', cls);
+        return c;
+      };
+      const wedge = document.createElementNS(NS, 'path');
+      wedge.setAttribute('class', 'pp-knob-wedge');
+      const track = circle('pp-knob-track', KNOB_R), fill = circle('pp-knob-fill', KNOB_R);
+      track.setAttribute('stroke-dasharray', `${ARC} ${C}`);
+      const halo = circle('pp-knob-halo', 8.5), thumb = circle('pp-knob-thumb', 6.5);
+      svg.append(wedge, track, fill, halo, thumb);
+      root.append(svg);
+      // Angles run clockwise from straight up: 0% at -135, 100% at +135.
+      const pointAt = (deg, radius) => {
+        const rad = deg * Math.PI / 180;
+        return [20 + radius * Math.sin(rad), 20 - radius * Math.cos(rad)];
+      };
+      let value = initialPct;
+      const render = () => {
+        const frac = value / 100;
+        const deg = KNOB_START + frac * KNOB_SPAN;
+        fill.setAttribute('stroke-dasharray', `${frac * ARC} ${C}`);
+        if (frac <= 0.001) {
+          wedge.setAttribute('d', '');
+        } else {
+          const WR = KNOB_R - 1.8;
+          const a = pointAt(KNOB_START, WR), b = pointAt(deg, WR);
+          const large = frac * KNOB_SPAN > 180 ? 1 : 0;
+          wedge.setAttribute('d',
+            `M 20 20 L ${a[0].toFixed(3)} ${a[1].toFixed(3)} ` +
+            `A ${WR} ${WR} 0 ${large} 1 ${b[0].toFixed(3)} ${b[1].toFixed(3)} Z`);
+        }
+        const t = pointAt(deg, KNOB_R);
+        thumb.setAttribute('cx', t[0]); thumb.setAttribute('cy', t[1]);
+        halo.setAttribute('cx', t[0]); halo.setAttribute('cy', t[1]);
+        root.setAttribute('aria-valuenow', String(Math.round(value)));
+        root.setAttribute('aria-valuetext', `${Math.round(value)}%`);
+      };
+      const set = pct => { value = Math.max(0, Math.min(100, pct)); render(); };
+      const commit = pct => { set(pct); onInput(Math.round(value)); };
+      const disabled = () => root.classList.contains('is-disabled');
+      // Read the pointer as an angle, not a vertical distance — that is what
+      // the grip promises. The dead zone at the bottom splits at straight down,
+      // so dragging off either end holds there instead of wrapping right round.
+      const valueAt = e => {
+        const b = root.getBoundingClientRect();
+        const dx = e.clientX - (b.left + b.width / 2);
+        const dy = e.clientY - (b.top + b.height / 2);
+        const deg = Math.atan2(dx, -dy) * 180 / Math.PI;
+        if (deg > 135) return 100;
+        if (deg < -135) return 0;
+        return ((deg - KNOB_START) / KNOB_SPAN) * 100;
+      };
+      let dragging = false;
+      root.addEventListener('pointerdown', e => {
+        if (disabled()) return;
+        dragging = true;
+        root.classList.add('is-dragging'); e.preventDefault();
+        // Land the tap before asking for pointer capture: capture can throw,
+        // and a tap that only registers when capture succeeds is a tap that
+        // silently does nothing — the exact complaint this change is fixing.
+        commit(snapVol(Math.round(valueAt(e))));
+        try { root.setPointerCapture(e.pointerId); } catch {}
+      });
+      root.addEventListener('pointermove', e => {
+        if (!dragging) return;
+        commit(snapVol(Math.round(valueAt(e))));
+      });
+      const endDrag = e => {
+        if (!dragging) return;
+        dragging = false; root.classList.remove('is-dragging');
+        try { root.releasePointerCapture(e.pointerId); } catch {}
+      };
+      root.addEventListener('pointerup', endDrag);
+      root.addEventListener('pointercancel', endDrag);
+      root.addEventListener('wheel', e => {
+        if (disabled()) return;
+        e.preventDefault(); commit(Math.round(value) + (e.deltaY < 0 ? 2 : -2));
+      }, { passive: false });
+      root.addEventListener('keydown', e => {
+        if (disabled()) return;
+        let v = value, handled = true;
+        if (e.key === 'ArrowUp' || e.key === 'ArrowRight') v += 5;
+        else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') v -= 5;
+        else if (e.key === 'PageUp') v += 25;
+        else if (e.key === 'PageDown') v -= 25;
+        else if (e.key === 'Home') v = 0;
+        else if (e.key === 'End') v = 100;
+        else handled = false;
+        if (handled) { e.preventDefault(); commit(v); }
+      });
+      set(initialPct);
+      return {
+        root, set,
+        setDisabled(b) { root.classList.toggle('is-disabled', b); root.tabIndex = b ? -1 : 0; },
+        setMuted(b) { root.classList.toggle('is-muted', b); },
+        get value() { return value; },
+      };
+    }
+
+    // One channel row per part: name · Solo/Isolate · volume knob · note
+    // readout · scrolling note lane. Same row, same order, as MidiPractice.
+    function buildTracks() {
+      tracksEl.innerHTML = '';
+      focusBtns = []; isoBtns = []; trackRows = [];
+      knobs = []; checkboxEls = [];
+      waveCanvases = []; noteNowEls = [];
+      song.parts.forEach((p, i) => {
+        const color = COLORS[i % COLORS.length];
+        const [r, g, b] = parseRgba(color);
+        const row = document.createElement('div'); row.className = 'pp-chan';
+        row.style.setProperty('--trk', `rgba(${r},${g},${b},0.95)`);
+
+        const lbl = document.createElement('label'); lbl.className = 'pp-chan-name'; lbl.htmlFor = `${prefix}-cb-${i}`;
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = `${prefix}-cb-${i}`; cb.checked = true;
+        const name = document.createElement('span'); name.className = 'pp-track-name'; name.textContent = p.label;
+        lbl.append(cb, name);
+
+        // Buttons live outside the <label> — iOS Safari fires a second synthetic
+        // click on the label after a button tap inside it.
+        const solo = document.createElement('button'); solo.type = 'button'; solo.className = 'pp-focus-btn';
+          // The word where there is room, a single letter where there is not.
+          // The narrow layouts put these beside the part name on one line, and
+          // "Solo" plus "Isolate" cost more width than the name itself. Both
+          // spellings are decoration to a screen reader: the button's real
+          // name is its aria-label.
+          solo.innerHTML = '<span class="pp-btn-long">Solo</span><span class="pp-btn-short" aria-hidden="true">S</span>';
+          solo.setAttribute('aria-label', `Emphasize ${p.label}`);
+        solo.title = 'Emphasize this part (others at 18%)';
+        solo.addEventListener('click', e => { e.preventDefault(); setFocus(i, 'solo'); });
+        const iso = document.createElement('button'); iso.type = 'button'; iso.className = 'pp-iso-btn';
+          iso.innerHTML = '<span class="pp-btn-long">Isolate</span><span class="pp-btn-short" aria-hidden="true">I</span>';
+          iso.setAttribute('aria-label', `Isolate ${p.label}`);
+        iso.title = 'Isolate this part (others muted)';
+        iso.addEventListener('click', e => { e.preventDefault(); setFocus(i, 'iso'); });
+        const btns = document.createElement('span'); btns.className = 'pp-chan-btns'; btns.append(solo, iso);
+
+        // No number beside the dial; see the note in MidiPractice. The arc
+        // already shows the level and aria-valuenow still speaks it.
+        const knob = makeKnob(p.label, 80, v => {
+          levels[i] = v / 100;
+          applyGains();
+        });
+
+        cb.addEventListener('change', () => {
+          enabled[i] = cb.checked;
+          applyGains();
+          knob.setMuted(!cb.checked);
+          row.classList.toggle('pp-chan-off', !cb.checked);
+          drawWave(currentPos());
+        });
+
+        const volWrap = document.createElement('div'); volWrap.className = 'pp-chan-vol';
+        volWrap.append(knob.root);
+        // Same wrapper as MidiPractice: display:contents on wide screens,
+        // its own second line on narrow ones
+        const ctrls = document.createElement('div'); ctrls.className = 'pp-chan-ctrls';
+        ctrls.append(btns, volWrap);
+        row.append(lbl, ctrls);
+
+        // Boxed live "current note" readout, then the note lane — both only
+        // where this song has note data. Tapping the readout sounds the note.
+        if (vizParts.length) {
+          const noteBox = document.createElement('span'); noteBox.className = 'pp-note-box';
+          if (!vizParts[i] || /piano|accomp|organ|instrument|orchestra/i.test(p.label)) {
+            noteBox.classList.add('is-off');
+            noteBox.setAttribute('aria-hidden', 'true');
+            noteNowEls.push(null);
+          } else {
+            noteBox.textContent = '–';
+            noteBox.dataset.part = p.label;
+            noteBox.classList.add('is-playable');
+            noteBox.setAttribute('role', 'button');
+            noteBox.tabIndex = 0;
+            noteBox.title = `Play this note (${p.label})`;
+            noteBox.setAttribute('aria-label', `No note for ${p.label} here`);
+            const idx = i;
+            noteBox.addEventListener('click', () => previewNote(idx));
+            noteBox.addEventListener('keydown', e => {
+              if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); previewNote(idx); }
+            });
+            noteNowEls.push(noteBox);
+          }
+          const cv = document.createElement('canvas'); cv.className = 'pp-lane'; cv.height = 44;
+          cv.setAttribute('aria-hidden', 'true');
+          waveCanvases.push(cv);
+          row.append(noteBox, cv);
+        }
+
+        tracksEl.appendChild(row);
+        focusBtns.push(solo); isoBtns.push(iso); trackRows.push(row);
+        knobs.push(knob); checkboxEls.push(cb);
+      });
+    }
+
+    // Update each part's boxed note readout to whatever sounds at the playhead.
+    // During a rest, show the part's NEXT note greyed out, so a singer can see
+    // the entry coming.
+    function updateNowNotes(pos) {
+      if (!noteNowEls.length) return;
+      const curBeat = secToBeat(pos);
+      vizParts.forEach((part, i) => {
+        const el = noteNowEls[i];
+        if (!el || !part) return;
+        let active = null, nextNote = null;
+        for (const n of part.notes) {
+          if (n.sb <= curBeat + 1e-6) { if (curBeat < n.eb - 1e-6) active = n; }
+          else if (!nextNote || n.sb < nextNote.sb) nextNote = n;
+        }
+        const picked = active || nextNote;
+        const coming = !active;
+        const txt = picked ? picked.nm : '–';
+        if (el.textContent !== txt) el.textContent = txt;
+        el.dataset.midi = picked ? String(picked.midi) : '';
+        el.setAttribute('aria-label', picked
+          ? `Play ${picked.nm} on ${el.dataset.part}`
+          : `No note for ${el.dataset.part} here`);
+        el.classList.toggle('is-coming', coming || !picked);
+      });
+    }
+
+    // Sound the note the readout is showing. The MIDI players have a sampled
+    // piano to borrow; here there is only the recording, so the pitch comes from
+    // a short plucked tone — routed through the part's own gain, so it stays
+    // silent if that part is unchecked, exactly as on a MIDI row.
+    function previewNote(i) {
+      const el = noteNowEls[i];
+      if (!el || !el.dataset.midi) return;
+      const midi = Number(el.dataset.midi);
+      if (!Number.isFinite(midi)) return;
+      const ctx = getCtx();
+      unlockAudio();
+      const at = ctx.currentTime + 0.01;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.exponentialRampToValueAtTime(0.28, at + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + 1.1);
+      osc.connect(g);
+      g.connect(gainNodes[i] || ctx.destination);
+      osc.start(at); osc.stop(at + 1.2);
+      el.classList.add('is-sounding');
+      setTimeout(() => el.classList.remove('is-sounding'), 260);
+    }
+
+    // The scrolling pitch lanes. Beat-for-beat the MIDI player's drawWave, with
+    // the playhead's beat read off the audio clock instead of Tone's transport.
+    function drawWave(pos) {
+      if (!waveCanvases.length) return;
+      updateNowNotes(pos);
+      const curBeat = secToBeat(pos);
+      const wStart = curBeat - WAVE_PLAYHEAD_FRAC * WINDOW_BEATS;
+      waveCanvases.forEach((cv, i) => {
+        const W = Math.round(cv.clientWidth || cv.getBoundingClientRect().width ||
+                             (cv.parentElement && cv.parentElement.clientWidth) || 0);
+        if (W <= 0) return;
+        const H = cv.height || 44;
+        if (cv.width !== W) cv.width = W;
+        const ctx2d = cv.getContext('2d');
+        ctx2d.clearRect(0, 0, W, H);
+        ctx2d.fillStyle = 'rgba(255,255,255,0.03)';
+        ctx2d.fillRect(0, 0, W, H);
+        const part = vizParts[i]; if (!part) return;
+        const pxPerBeat = W / WINDOW_BEATS;
+        // Beat lines, with the bar lines brighter.
+        for (let b = Math.ceil(wStart); b < wStart + WINDOW_BEATS; b++) {
+          const x = Math.round((b - wStart) * pxPerBeat);
+          const isBar = hasGrid && ((b - PICKUP_BEATS) % BEATS_PER_BAR === 0);
+          ctx2d.fillStyle = isBar ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.05)';
+          ctx2d.fillRect(x, 0, 1, H);
+        }
+        let noteColor = COLORS[i % COLORS.length];
+        if (!enabled[i]) noteColor = 'rgba(170,170,170,0.22)';
+        else if (focusedTrack !== null && i !== focusedTrack) {
+          noteColor = focusMode === 'iso'
+            ? 'rgba(170,170,170,0.22)'
+            : noteColor.replace(/,\s*[\d.]+\)$/, ',0.25)');
+        }
+        ctx2d.fillStyle = noteColor;
+        const span = Math.max(1, part.hi - part.lo);
+        for (const n of part.notes) {
+          const x0 = (n.sb - wStart) * pxPerBeat, x1 = (n.eb - wStart) * pxPerBeat;
+          if (x1 < 0 || x0 > W) continue;
+          const cx0 = Math.max(0, x0), cx1 = Math.min(W, x1);
+          const yFrac = (n.midi - part.lo) / span;
+          const y = Math.round((1 - yFrac) * (H - 8) + 4);
+          ctx2d.fillRect(cx0, y - 2, Math.max(2, cx1 - cx0), 4);
+        }
+        const px = Math.round(WAVE_PLAYHEAD_FRAC * W);
+        ctx2d.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx2d.fillRect(px, 0, 1, H);
+      });
+    }
+
+    // Per-part gain after mutes, solo and isolate. applyGains() drives the
+    // speakers and renderMix() drives the exported file, so both read this and
+    // the file always matches what the singer just heard.
+    function currentGains() {
+      const focused = focusedTrack !== null;
+      return song.parts.map((_, i) => {
+        let v = enabled[i] ? (levels[i] ?? 0.8) : 0;
+        if (focused && enabled[i]) v = (i === focusedTrack) ? 1.0 : (focusMode === 'iso' ? 0 : v * 0.18);
+        return v;
+      });
+    }
+
+    function applyGains() {
+      const gains = currentGains();
+      gainNodes.forEach((g, i) => { g.gain.value = gains[i]; });
+    }
+
+    function syncFocusUI() {
+      const focused = focusedTrack !== null;
+      focusBtns.forEach((b, j) => b.classList.toggle('is-focused', focusedTrack === j && focusMode === 'solo'));
+      isoBtns.forEach((b, j) => b.classList.toggle('is-focused', focusedTrack === j && focusMode === 'iso'));
+      trackRows.forEach((r, j) => r.classList.toggle('pp-dimmed', focused && focusedTrack !== j));
+      knobs.forEach((knob, i) => {
+        const origLevel = savedLevels[i] ?? levels[i] ?? 0.8;
+        let displayPct;
+        if (!focused) displayPct = Math.round((levels[i] ?? 0.8) * 100);
+        else if (i === focusedTrack) displayPct = 100;
+        else displayPct = focusMode === 'iso' ? 0 : Math.round(origLevel * 18);
+        knob.set(displayPct);
+        knob.setDisabled(focused && i !== focusedTrack);
+      });
+    }
+
+    function setFocus(trackIdx, mode) {
+      if (focusedTrack === trackIdx && focusMode === mode) { clearFocus(); return; }
+      if (focusedTrack === null) savedLevels = levels.slice();
+      focusedTrack = trackIdx; focusMode = mode;
+      syncFocusUI(); applyGains(); drawWave(currentPos());
+    }
+    function clearFocus() {
+      focusedTrack = null; focusMode = null; savedLevels = [];
+      syncFocusUI(); applyGains(); drawWave(currentPos());
+    }
+
+    // ---- Position + drawing (time domain) ----
+    function currentPos() {
+      if (isMobile && isPlaying && audioEls[0]) return Math.min(audioEls[0].currentTime, duration);
+      return isPlaying
+        ? Math.min(pauseOffset + (getCtx().currentTime - startedAt) * playbackRate, duration)
+        : pauseOffset;
+    }
+
+    function draw(pos) {
+      const p = pos == null ? currentPos() : pos;
+      const frac = duration > 0 ? Math.min(1, p / duration) : 0;
+      fillEl.style.width = (frac * 100) + '%';
+      headEl.style.left = (frac * 100) + '%';
+      trackEl.setAttribute('aria-valuenow', String(Math.round(frac * 100)));
+      timeEl.textContent = `${fmt(p)} / ${fmt(duration)}`;
+      if (hasGrid && measureEl && measureEl.style.display !== 'none') {
+        const m = measureAt(p), beat = beatAt(p);
+        const label = `m. ${m} · ${beat}`;
+        measureEl.textContent = label;
+        measureEl.setAttribute('aria-label', `Measure ${m}, beat ${beat}`);
+        if (miniMeasure) miniMeasure.textContent = label;
+      }
+      drawWave(p);
+    }
+
+    // ---- Playback (ported from the spring2026 recorded-audio engine) ----
+    function makeSoundTouchNode(buf, gNode, ctx, startTime) {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const stNode = new _stMod.SoundTouchNode({ context: ctx });
+      // Vary the source's playbackRate (speed+pitch), then mirror it on the
+      // node so SoundTouch compensates pitch back → pitch-preserving stretch.
+      src.playbackRate.value = playbackRate;
+      stNode.playbackRate.value = playbackRate;
+      src.connect(stNode); stNode.connect(gNode);
+      src.start(startTime, pauseOffset);
+      return {
+        stop() { try { src.stop(); } catch {} try { stNode.disconnect(); src.disconnect(); } catch {} },
+        // Lets a tempo change nudge a running node instead of tearing the whole
+        // graph down and starting over, which is what made the audible gap.
+        setRate(rate) {
+          try { src.playbackRate.value = rate; stNode.playbackRate.value = rate; } catch {}
+        },
+      };
+    }
+
+    async function play() {
+      cancelAnimationFrame(rafId);
+      stTimers.forEach(clearTimeout); stTimers = [];
+      // Claim this attempt. Anything that supersedes it (another play, a pause,
+      // a stop, a teardown) bumps playGen, and the checks after each await below
+      // make this call bail out rather than install its nodes over the top.
+      const myGen = ++playGen;
+      if (isMobile) {
+        applyGains();
+        await Promise.all(audioEls.map(el => {
+          el.currentTime = pauseOffset; el.playbackRate = playbackRate;
+          return el.play().catch(e => console.error('[audio play mobile]', e));
+        }));
+        if (myGen !== playGen) {
+          // The elements are already sounding by this point, so silence them on
+          // the way out — returning without this would leave audio playing that
+          // nothing considers "playing".
+          audioEls.forEach(el => { try { el.onended = null; el.pause(); } catch {} });
+          return;
+        }
+        isPlaying = true;
+        audioEls[audioEls.length - 1].onended = () => { if (isPlaying && !loopEnabled) stopPlayback(); };
+      } else {
+        const audio = getCtx();
+        let now;
+        if (Math.abs(playbackRate - 1.0) > 0.004) {
+          let stOk = false;
+          try {
+            await loadSoundTouch();
+            // The worklet load is the long await, and the window where a second
+            // tempo click or a loop wrap used to slip in and orphan these nodes.
+            if (myGen !== playGen) return;
+            now = audio.currentTime;
+            sources = buffers.map((buf, i) => makeSoundTouchNode(buf, gainNodes[i], audio, now));
+            stActive = true;
+            const remaining = (duration - pauseOffset) / playbackRate;
+            stTimers.push(setTimeout(() => { if (isPlaying && !loopEnabled) stopPlayback(); }, remaining * 1000 + 300));
+            stOk = true;
+          } catch (e) {
+            console.error('[audio play] SoundTouch unavailable, falling back:', e);
+            sources.forEach(s => { try { s.stop?.(); } catch {} });
+            sources = [];
+          }
+          if (!stOk) {
+            if (myGen !== playGen) return;
+            now = audio.currentTime;
+            stActive = false;
+            sources = buffers.map((buf, i) => {
+              const src = audio.createBufferSource();
+              src.buffer = buf; src.playbackRate.value = playbackRate;
+              src.connect(gainNodes[i]);
+              src.start(now, pauseOffset); src.stop(now + (duration - pauseOffset) / playbackRate);
+              return src;
+            });
+            sources[sources.length - 1].onended = () => { if (isPlaying && !loopEnabled) stopPlayback(); };
+          }
+        } else {
+          now = audio.currentTime;
+          stActive = false;
+          sources = buffers.map((buf, i) => {
+            const src = audio.createBufferSource();
+            src.buffer = buf; src.playbackRate.value = 1.0;
+            src.connect(gainNodes[i]);
+            src.start(now, pauseOffset); src.stop(now + (duration - pauseOffset));
+            return src;
+          });
+          sources[sources.length - 1].onended = () => { if (isPlaying && !loopEnabled) stopPlayback(); };
+        }
+        startedAt = now; isPlaying = true;
+      }
+      if (metronomeOn) metroStart();
+      updatePlayIcon();
+      tick();
+    }
+
+    function teardownSources() {
+      // Invalidate any play() still waiting on the SoundTouch worklet, so it
+      // can't finish and attach nodes to a graph we just tore down.
+      playGen++;
+      stTimers.forEach(clearTimeout); stTimers = [];
+      sources.forEach(s => { try { s.onended = null; s.stop(); } catch {} });
+      sources = [];
+      stActive = false;
+    }
+
+    function pausePlayback() {
+      pauseOffset = currentPos();
+      metroStop();
+      playGen++; // cancel any in-flight play()
+      if (isMobile) audioEls.forEach(el => { el.onended = null; el.pause(); });
+      else teardownSources();
+      isPlaying = false; cancelAnimationFrame(rafId);
+      updatePlayIcon();
+    }
+
+    function fadeAndPause() {
+      if (!isPlaying) return;
+      const FADE_MS = 350, snapPos = currentPos();
+      cancelAnimationFrame(rafId); isPlaying = false; updatePlayIcon();
+      metroStop();
+      const myGen = ++playGen;
+      const audio = getCtx(), now = audio.currentTime, fadeEnd = now + FADE_MS / 1000;
+      gainNodes.forEach(g => {
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(g.gain.value, now);
+        g.gain.linearRampToValueAtTime(0, fadeEnd);
+      });
+      setTimeout(() => {
+        // Pressing play during the 350ms fade used to get its position thrown
+        // away by this callback, which reset pauseOffset unconditionally. If
+        // playback resumed in the meantime, leave everything alone.
+        if (myGen !== playGen) return;
+        if (isMobile) audioEls.forEach(el => { el.onended = null; el.pause(); });
+        else teardownSources();
+        const ct = getCtx().currentTime;
+        gainNodes.forEach((g, i) => { g.gain.cancelScheduledValues(ct); g.gain.value = enabled[i] ? (levels[i] ?? 0.8) : 0; });
+        pauseOffset = snapPos;
+      }, FADE_MS + 50);
+    }
+
+    function stopPlayback() {
+      metroStop();
+      playGen++; // cancel any in-flight play(), same reason as teardownSources
+      stTimers.forEach(clearTimeout); stTimers = [];
+      stActive = false;
+      if (isMobile) {
+        audioEls.forEach(el => { el.onended = null; el.pause(); el.currentTime = 0; });
+        const ct = getCtx().currentTime;
+        gainNodes.forEach((g, i) => { g.gain.cancelScheduledValues(ct); g.gain.value = enabled[i] ? (levels[i] ?? 0.8) : 0; });
+      } else {
+        sources.forEach(s => { try { s.onended = null; s.stop(); } catch {} });
+        sources = [];
+      }
+      isPlaying = false; pauseOffset = 0; cancelAnimationFrame(rafId);
+      updatePlayIcon();
+      draw(0);
+    }
+
+    function seek(newOffset) {
+      if (!loaded) return;
+      const pos = Math.max(0, Math.min(newOffset, duration));
+      if (isMobile) {
+        pauseOffset = pos;
+        audioEls.forEach(el => { el.currentTime = pos; });
+        if (!isPlaying) draw(pos);
+      } else if (isPlaying) {
+        teardownSources(); pauseOffset = pos; play();
+      } else {
+        pauseOffset = pos; draw(pos);
+      }
+    }
+
+    function tick() {
+      if (!isPlaying) return;
+      const pos = currentPos();
+      if (loopEnabled && loopEnd > loopStart && pos >= loopEnd) {
+        if (isMobile) audioEls.forEach(el => { el.onended = null; el.pause(); });
+        else teardownSources();
+        pauseOffset = loopStart; play(); return;
+      }
+      draw(pos);
+      rafId = requestAnimationFrame(tick);
+    }
+
+    function updatePlayIcon() {
+      playBtn.classList.toggle('is-playing', isPlaying);
+      if (miniPlay) miniPlay.classList.toggle('is-playing', isPlaying);
+    }
+
+    playBtn.addEventListener('click', () => { isPlaying ? pausePlayback() : play(); });
+    registerSpaceToPlay({ isOpen: () => !panel.hidden, playButton: playBtn });
+    stopBtn.addEventListener('click', () => stopPlayback());
+    skipBackBtn.addEventListener('click', () => seek(currentPos() - 15));
+    skipFwdBtn.addEventListener('click', () => seek(currentPos() + 15));
+    trackEl.addEventListener('click', e => {
+      if (!loaded) return;
+      const frac = (e.clientX - trackEl.getBoundingClientRect().left) / trackEl.offsetWidth;
+      seek(Math.max(0, Math.min(1, frac)) * duration);
+    });
+
+    // ---- A-B loop, punched in ----
+    // Same control as MidiPractice: press the button where the passage starts,
+    // press it again where it ends. Nothing repeats in between, so the singer
+    // marks both ends by ear. On a track with a measure grid both presses land
+    // on a bar line and the boxes hold printed measures; without one they land
+    // where the playhead is and the boxes hold times, because a measure is not
+    // a unit that song has.
+    const minGap = 1;
+    // The bar line at or before a moment, and the one after it.
+    const barLineAt = sec => Math.max(0, barStartSec(measureAt(sec)));
+    const nextBarLine = sec => Math.min(duration, barStartSec(measureAt(sec) + 1));
+
+    function updateLoopMarkers() {
+      const startPct = duration > 0 ? (loopStart / duration) * 100 : 0;
+      const endPct = duration > 0 ? (loopEnd / duration) * 100 : 0;
+      loopStartMk.style.left = `${startPct}%`;
+      loopEndMk.style.left = `${endPct}%`;
+      loopRegion.style.left = `${startPct}%`;
+      loopRegion.style.width = `${endPct - startPct}%`;
+      if (document.activeElement !== loopStartEl) loopStartEl.value = edgeText(loopStart, false);
+      if (document.activeElement !== loopEndEl) loopEndEl.value = edgeText(loopEnd, true);
+      if (loopMeasuresEl) {
+        const secs = fmt(Math.max(0, loopEnd - loopStart));
+        if (hasGrid) {
+          const bars = Math.max(1, measureAt(Math.max(loopStart, loopEnd - 0.01)) - measureAt(loopStart) + 1);
+          loopMeasuresEl.textContent = `${bars} bar${bars === 1 ? '' : 's'} · ${secs}`;
+        } else {
+          loopMeasuresEl.textContent = secs;
+        }
+      }
+      updateStepButtons();
+    }
+
+    // What a box shows for an edge. With a grid it is the printed measure, and
+    // the end box is inclusive: it names the last measure the loop plays.
+    // Without a grid both are plain times, exactly as they were.
+    function edgeText(sec, isEnd) {
+      if (!hasGrid) return fmt(sec);
+      return String(measureAt(isEnd ? Math.max(loopStart, sec - 0.01) : sec));
+    }
+
+    function canStep(edge, delta) {
+      if (!loaded || !loopEnabled || !hasGrid) return false;
+      if (edge === 'start') {
+        const m = measureAt(loopStart);
+        // A start left mid-bar by a drag steps back to its own bar line first.
+        const from = (delta < 0 && loopStart > barLineAt(loopStart) + 0.001) ? m + 1 : m;
+        const want = from + delta;
+        if (want < 1 || (totalMeasures && want > totalMeasures)) return false;
+        return barStartSec(want) <= loopEnd - minGap;
+      }
+      const m = measureAt(Math.max(loopStart, loopEnd - 0.01));
+      const want = m + 1 + delta;
+      if (want < 2 || (totalMeasures && want > totalMeasures + 1)) return false;
+      return Math.min(duration, barStartSec(want)) >= loopStart + minGap;
+    }
+
+    function updateStepButtons() {
+      for (const b of stepBtns) b.disabled = !canStep(b.dataset.edge, Number(b.dataset.delta));
+    }
+
+    function stepEdge(edge, delta) {
+      if (!canStep(edge, delta)) return;
+      if (edge === 'start') {
+        const m = measureAt(loopStart);
+        const from = (delta < 0 && loopStart > barLineAt(loopStart) + 0.001) ? m + 1 : m;
+        loopStart = barStartSec(from + delta);
+      } else {
+        const m = measureAt(Math.max(loopStart, loopEnd - 0.01));
+        loopEnd = Math.min(duration, barStartSec(m + 1 + delta));
+      }
+      updateLoopMarkers();
+      const at = currentPos();
+      if (at < loopStart || at >= loopEnd) seek(loopStart);
+    }
+
+
+    // Same hint as MidiPractice: point at the marker that is the singer's next
+    // decision, and stop pointing once it is made. See the note there.
+    const HINT_MS = 8000;
+    const hintTimers = new WeakMap();
+    function hintMarker(mk, ms) {
+      if (!mk) return;
+      clearTimeout(hintTimers.get(mk));
+      mk.classList.add('is-hint');
+      if (ms) hintTimers.set(mk, setTimeout(() => mk.classList.remove('is-hint'), ms));
+    }
+    function clearHint(mk) {
+      if (!mk) return;
+      clearTimeout(hintTimers.get(mk));
+      mk.classList.remove('is-hint');
+    }
+
+    function renderLoopUI() {
+      const running = loopEnabled && loopEnd > loopStart;
+      loopBtn.classList.toggle('is-armed', punchArmed);
+      loopBtn.classList.toggle('is-active', running);
+      const label = punchArmed ? 'End' : 'Loop';
+      if (loopLabel) loopLabel.textContent = label;
+      loopBtn.setAttribute('aria-label',
+        punchArmed ? 'Loop ends here'
+          : (running ? 'Start a new loop from here' : 'Loop from here'));
+      loopBtn.title = punchArmed
+        ? 'Press where the passage ends'
+        : (running
+          ? 'Start a new loop: press where it begins, then again where it ends'
+          : 'Press where the passage starts, then again where it ends');
+
+      loopBar.style.display = (punchArmed || running) ? 'flex' : 'none';
+      loopArmedEl.style.display = punchArmed ? 'flex' : 'none';
+      loopStepsEl.style.display = running ? 'flex' : 'none';
+      if (punchArmed) {
+        const where = hasGrid ? `m. ${measureAt(loopStart)}` : fmt(loopStart);
+        loopArmedText.innerHTML = `Loop starts at <b>${where}</b>. Press again where it ends.`;
+      }
+      loopStartMk.style.display = (punchArmed || running) ? 'block' : 'none';
+      loopEndMk.style.display = running ? 'block' : 'none';
+      loopRegion.style.display = running ? 'block' : 'none';
+      if (punchArmed) hintMarker(loopStartMk, 0); else clearHint(loopStartMk);
+      if (!running) clearHint(loopEndMk);
+      updateStepButtons();
+    }
+
+    loopBtn.addEventListener('click', () => {
+      if (!loaded) return;
+      const here = hasGrid ? barLineAt(currentPos()) : currentPos();
+      let closedJustNow = false;
+      if (!punchArmed) {
+        punchArmed = true;
+        loopEnabled = false;
+        loopStart = Math.max(0, Math.min(here, duration));
+        loopEnd = loopStart;
+        // Same card, same rule, as the MIDI rows: the press that STARTS a loop
+        // explains itself until the singer says not to. The mark is taken
+        // first, and the music pauses so the passage does not run past while
+        // the card is up.
+        if (!loopHowToDismissed()) {
+          if (isPlaying) pausePlayback();
+          openLoopHowTo(hasGrid ? `m. ${measureAt(loopStart)}` : fmt(loopStart));
+        }
+      } else {
+        const a = Math.min(loopStart, here), b = Math.max(loopStart, here);
+        loopStart = a;
+        loopEnd = hasGrid
+          ? Math.min(duration, nextBarLine(b))
+          : Math.min(duration, Math.max(b, a + minGap));
+        punchArmed = false;
+        loopEnabled = true;
+        closedJustNow = true;
+      }
+      updateLoopMarkers();
+      renderLoopUI();
+      if (closedJustNow) hintMarker(loopEndMk, HINT_MS);
+      if (loopEnabled) seek(loopStart);
+    });
+
+    function loopOff() {
+      punchArmed = false;
+      loopEnabled = false;
+      renderLoopUI();
+    }
+    if (loopOffBtn) loopOffBtn.addEventListener('click', loopOff);
+    if (loopCancelBtn) loopCancelBtn.addEventListener('click', loopOff);
+    // The way back to the card after "Do not show this again".
+    if (loopHelpBtn) loopHelpBtn.addEventListener('click', () => openLoopHowTo(null));
+
+    // Press and hold to cross ground: first repeat after 400ms, then eight a
+    // second. Same timings as the MIDI player, so the two feel alike.
+    for (const btn of stepBtns) {
+      const edge = btn.dataset.edge, delta = Number(btn.dataset.delta);
+      let holdTimer = null, repeatTimer = null;
+      const stop = () => {
+        clearTimeout(holdTimer); clearInterval(repeatTimer);
+        holdTimer = repeatTimer = null;
+      };
+      btn.addEventListener('click', () => stepEdge(edge, delta));
+      btn.addEventListener('pointerdown', () => {
+        stop();
+        holdTimer = setTimeout(() => {
+          repeatTimer = setInterval(() => {
+            if (!canStep(edge, delta)) { stop(); return; }
+            stepEdge(edge, delta);
+          }, 125);
+        }, 400);
+      });
+      for (const ev of ['pointerup', 'pointerleave', 'pointercancel', 'blur']) {
+        btn.addEventListener(ev, stop);
+      }
+    }
+
+    // A typed box. With a grid it takes a measure ("33") or the whole passage
+    // ("33-40"); without one it takes a time, the way it always did.
+    const RANGE_RE = /^\s*(?:mm?\.?\s*)?(\d+)\s*(?:-|–|—|to|through|thru)\s*(\d+)\s*$/i;
+    function readEdge(text, isEnd) {
+      if (!hasGrid) return parseTime(text);
+      const n = String(text).match(/\d+/);
+      if (!n) return null;
+      const last = totalMeasures || Infinity;
+      const m = Math.max(1, Math.min(Number(n[0]), last));
+      return isEnd ? Math.min(duration, barStartSec(m + 1)) : barStartSec(m);
+    }
+    function applyTypedRange(text) {
+      if (!hasGrid) return false;
+      const m = String(text).match(RANGE_RE);
+      if (!m) return false;
+      const last = totalMeasures || Infinity;
+      const a = Math.max(1, Math.min(Number(m[1]), last));
+      const b = Math.max(a, Math.min(Number(m[2]), last));
+      loopStart = Math.max(0, Math.min(barStartSec(a), duration - minGap));
+      loopEnd = Math.max(loopStart + minGap, Math.min(barStartSec(b + 1), duration));
+      punchArmed = false;
+      loopEnabled = true;
+      return true;
+    }
+
+    loopStartEl.addEventListener('change', () => {
+      if (!loaded) return;
+      if (!applyTypedRange(loopStartEl.value)) {
+        const at = readEdge(loopStartEl.value, false);
+        if (at !== null) loopStart = Math.max(0, Math.min(at, loopEnd - minGap));
+      }
+      updateLoopMarkers(); renderLoopUI(); seek(loopStart);
+    });
+    loopEndEl.addEventListener('change', () => {
+      if (!loaded) return;
+      if (applyTypedRange(loopEndEl.value)) {
+        updateLoopMarkers(); renderLoopUI(); seek(loopStart);
+        return;
+      }
+      const at = readEdge(loopEndEl.value, true);
+      if (at !== null) loopEnd = Math.max(loopStart + minGap, Math.min(at, duration));
+      updateLoopMarkers(); renderLoopUI();
+    });
+
+    for (const [box, edge] of [[loopStartEl, 'start'], [loopEndEl, 'end']]) {
+      box.addEventListener('keydown', e => {
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+        e.preventDefault();
+        stepEdge(edge, e.key === 'ArrowUp' ? 1 : -1);
+      });
+    }
+
+    function initMarkerDrag(marker, onUpdate, onDragEnd) {
+      let dragging = false;
+      const trackSec = x => {
+        const r = trackEl.getBoundingClientRect();
+        return Math.max(0, Math.min(1, (x - r.left) / r.width)) * duration;
+      };
+      const finish = () => {
+        if (!dragging) return;
+        dragging = false; marker.classList.remove('dragging');
+        if (onDragEnd) onDragEnd();
+      };
+      marker.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); dragging = true; marker.classList.add('dragging'); });
+      document.addEventListener('mousemove', e => { if (dragging) onUpdate(trackSec(e.clientX)); });
+      document.addEventListener('mouseup', finish);
+      marker.addEventListener('touchstart', e => { e.preventDefault(); e.stopPropagation(); dragging = true; marker.classList.add('dragging'); }, { passive: false });
+      document.addEventListener('touchmove', e => { if (!dragging) return; e.preventDefault(); onUpdate(trackSec(e.touches[0].clientX)); }, { passive: false });
+      document.addEventListener('touchend', finish);
+    }
+    for (const mk of [loopStartMk, loopEndMk]) {
+      mk.addEventListener('pointerdown', () => clearHint(mk));
+    }
+    initMarkerDrag(loopStartMk, sec => {
+      // While the button is armed there is no end yet, so the usual "stay a
+      // second clear of the end" ceiling would drag the start backwards on
+      // every frame. Armed, the start is free and the inert end follows it.
+      const ceiling = punchArmed ? duration : loopEnd - minGap;
+      loopStart = Math.max(0, Math.min(sec, ceiling));
+      if (punchArmed) loopEnd = loopStart;
+      updateLoopMarkers(); renderLoopUI();
+    }, () => seek(loopStart));
+    initMarkerDrag(loopEndMk, sec => {
+      loopEnd = Math.max(loopStart + minGap, Math.min(sec, duration));
+      updateLoopMarkers();
+    });
+
+    // ---- Metronome ----
+    // A steady click at the score's marked tempo, scheduled a beat at a time on
+    // the AudioContext clock so it stays even. It follows the tempo slider: at
+    // 70% the click slows with the audio.
+    //
+    // It lands on the grid, not on whenever you pressed play, so the accent
+    // falls on the downbeat the measure readout is showing. That only works
+    // because these recordings hold a fixed tempo; a recording that breathes
+    // would drift away from the click within a few bars, and a song like that
+    // should leave `bpm` unset so this button never appears.
+    let metronomeOn = false, metroNextBeat = 0, metroBeat = 0, metroTimer = null;
+    const METRO_BPM = SCORE_BPM;
+    const METRO_BEATS = BEATS_PER_BAR;
+    // Metronome volume, 0-100, on the same dial the MIDI players use. 80 is the
+    // default there and lands on the level this click always had, so nothing
+    // sounds different until somebody moves it.
+    let metroLevel = 80;
+    const metroGain = pct => (pct <= 0 ? 0 : Math.pow(pct / 100, 2));
+
+    // Clicks already handed to the audio clock. Stopping the timer does not
+    // unschedule these, so switching the metronome off used to leave up to a
+    // quarter second of clicking behind it. Tone.js cancels its own scheduled
+    // events when a Loop stops, so the MIDI players never had that tail.
+    let metroVoices = [];
+
+    function clickAt(when, accent) {
+      const level = metroGain(metroLevel);
+      if (level <= 0) return;
+      const ctx = getCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = accent ? 1600 : 1000;
+      gain.gain.setValueAtTime(0.0001, when);
+      gain.gain.exponentialRampToValueAtTime((accent ? 0.5 : 0.28) * level, when + 0.002);
+      gain.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(when); osc.stop(when + 0.06);
+      osc.onended = () => { try { gain.disconnect(); } catch {} };
+      metroVoices.push(osc);
+      // Anything already finished is not worth carrying.
+      if (metroVoices.length > 8) metroVoices = metroVoices.slice(-8);
+    }
+
+    // True when this beat of the grid is a downbeat.
+    const isDownbeat = beatIdx =>
+      (((beatIdx - PICKUP_BEATS) % METRO_BEATS) + METRO_BEATS) % METRO_BEATS === 0;
+
+    function metroSchedule() {
+      if (!metronomeOn) return;
+      const ctx = getCtx();
+      // Schedule a little ahead so timer jitter never becomes audible jitter.
+      const HORIZON = 0.25;
+      const secPerBeat = (60 / METRO_BPM) / (playbackRate || 1);
+      while (metroNextBeat < ctx.currentTime + HORIZON) {
+        clickAt(Math.max(metroNextBeat, ctx.currentTime), isDownbeat(metroBeat));
+        metroNextBeat += secPerBeat;
+        metroBeat += 1;
+      }
+    }
+
+    function metroStart() {
+      if (!METRO_BPM) return;
+      const ctx = getCtx();
+      const pos = currentPos();
+      // Start on the next beat line of the score rather than 60 ms from now, so
+      // the accent lands with the downbeat the singer can hear.
+      const nextBeat = Math.ceil(secToBeat(pos) - 1e-6);
+      const ahead = (beatToSec(nextBeat) - pos) / (playbackRate || 1);
+      metroNextBeat = ctx.currentTime + Math.max(0.06, ahead);
+      metroBeat = nextBeat;
+      clearInterval(metroTimer);
+      metroTimer = setInterval(metroSchedule, 60);
+      metroSchedule();
+    }
+
+    function metroStop() {
+      clearInterval(metroTimer); metroTimer = null;
+      // Silence the clicks that are already on the clock, so "off" is off now
+      // and not a quarter second from now.
+      const ctx = sharedCtx;
+      metroVoices.forEach(osc => {
+        try { osc.stop(ctx ? ctx.currentTime : 0); } catch {}
+        try { osc.disconnect(); } catch {}
+      });
+      metroVoices = [];
+    }
+
+    let metroKnob = null;
+    if (metroBtn) {
+      metroKnob = makeKnob('metronome', metroLevel, v => { metroLevel = v; });
+      metroKnob.root.classList.add('pp-knob-sm');
+      metroKnob.root.title = 'Metronome volume';
+      metroKnob.setMuted(true);
+      if (metroVolEl) metroVolEl.appendChild(metroKnob.root);
+
+      metroBtn.addEventListener('click', () => {
+        metronomeOn = !metronomeOn;
+        metroBtn.classList.toggle('is-active', metronomeOn);
+        metroBtn.setAttribute('aria-pressed', String(metronomeOn));
+        // Dim the dial while the metronome is off, the same way an unchecked
+        // voice part dims its own.
+        metroKnob.setMuted(!metronomeOn);
+        // Only audible while the song is playing, same as the MIDI player — a
+        // toggle that started ticking over a stopped player would be a surprise.
+        if (metronomeOn && isPlaying) metroStart();
+        if (!metronomeOn) metroStop();
+      });
+    }
+
+    // ---- Tempo (playbackRate; pitch preserved via SoundTouch) ----
+    function setActiveTempo(rate) {
+      tempoSteps.querySelectorAll('.pp-tempo-step').forEach(x =>
+        x.classList.toggle('is-active', Math.abs(parseFloat(x.dataset.rate) - rate) < 0.001));
+    }
+    function applyRate(rate) {
+      const pos = currentPos();
+      const wasST = stActive;
+      const needsST = Math.abs(rate - 1.0) > 0.004;
+      playbackRate = rate;
+      setActiveTempo(rate);
+      if (!isPlaying) return;
+
+      if (isMobile) { audioEls.forEach(el => { el.playbackRate = rate; }); return; }
+
+      // Moving between two stretched tempos (say 70% to 80%) keeps the same node
+      // graph, so nudge the running nodes instead of rebuilding. Rebuilding is
+      // what a singer heard as a stutter: it stops every source, waits on the
+      // worklet, and starts fresh ones. Only crossing in or out of 100% needs a
+      // rebuild, because that adds or removes the SoundTouch node entirely.
+      if (wasST && needsST && sources.length && sources.every(s => typeof s.setRate === 'function')) {
+        // Rebase the clock first: currentPos() assumes one constant rate since
+        // startedAt, so without this the playhead jumps.
+        pauseOffset = pos;
+        startedAt = getCtx().currentTime;
+        sources.forEach(s => s.setRate(rate));
+        // The end-of-song timer was sized for the old rate.
+        stTimers.forEach(clearTimeout); stTimers = [];
+        const remaining = (duration - pauseOffset) / rate;
+        stTimers.push(setTimeout(() => { if (isPlaying && !loopEnabled) stopPlayback(); }, remaining * 1000 + 300));
+        return;
+      }
+
+      teardownSources(); pauseOffset = pos; play();
+    }
+    // The tempo the buttons are set to, which the saloon egg overrides without
+    // disturbing. playbackRate always holds the rate actually in use.
+    let userRate = 1;
+    function eggOff() {
+      if (!eggActive) return;
+      eggActive = false;
+      eggBtn.classList.remove('is-active');
+      applyRate(userRate);
+    }
+    eggBtn.addEventListener('click', () => {
+      if (!loaded) return;
+      eggActive = !eggActive;
+      eggBtn.classList.toggle('is-active', eggActive);
+      applyRate(eggActive ? 0.5 : userRate);
+      // The step buttons still show the tempo the singer chose, so put the
+      // highlight back where it belongs after applyRate moved it.
+      setActiveTempo(userRate);
+    });
+    tempoSteps.querySelectorAll('.pp-tempo-step').forEach(b => {
+      b.addEventListener('click', () => {
+        if (!loaded) return;
+        userRate = parseFloat(b.dataset.rate);
+        eggActive = false;
+        eggBtn.classList.remove('is-active');
+        applyRate(userRate);
+      });
+    });
+    tempoResetBtn.addEventListener('click', () => {
+      if (!loaded) return;
+      userRate = 1; eggActive = false; eggBtn.classList.remove('is-active');
+      applyRate(1);
+      if (metroKnob) { metroLevel = 80; metroKnob.set(80); }
+      clearFocus();
+      knobs.forEach((knob, i) => { knob.setDisabled(false); knob.setMuted(false); knob.set(80); levels[i] = 0.8; });
+      checkboxEls.forEach((cb, i) => { cb.checked = true; enabled[i] = true; });
+      trackRows.forEach(row => row.classList.remove('pp-chan-off'));
+      applyGains();
+    });
+
+    // ---- Score view (manual paging; no note-sync for recorded audio) ----
+    async function ensurePdfJs() {
+      if (window.pdfjsLib) return;
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+        s.onload = res; s.onerror = rej; document.head.appendChild(s);
+      });
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+
+    async function renderPage(num) {
+      if (pdfRendering) {
+        const n = pdfDoc ? Math.max(1, Math.min(pdfDoc.numPages, num)) : num;
+        queuedPage = n; targetPage = n;
+        return;
+      }
+      await ensurePdfJs();
+      if (!pdfDoc) {
+        if (sheetLoading) { sheetLoading.textContent = 'Loading score…'; sheetLoading.classList.remove('hidden'); }
+        try {
+          const resp = await fetch(song.sheetPdf);
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          pdfDoc = await window.pdfjsLib.getDocument({ data: await resp.arrayBuffer() }).promise;
+        } catch (e) { if (sheetLoading) sheetLoading.textContent = 'Could not load score.'; return; }
+        if (sheetLoading) sheetLoading.classList.add('hidden');
+      }
+      num = Math.max(1, Math.min(pdfDoc.numPages, num));
+      targetPage = num;
+      pdfRendering = true;
+      try {
+        const page = await pdfDoc.getPage(num);
+        const wrap = sheetCanvas.parentElement;
+        const maxW = Math.max(200, (wrap.clientWidth || 600) - 4);
+        const vp0 = page.getViewport({ scale: 1 });
+        renderScale = maxW / vp0.width;
+        // Render at the display's real pixel density, capped at 2. One bitmap
+        // pixel per CSS pixel left the staves soft on a retina screen, and half
+        // of "the music is hard to read" was sharpness, not size.
+        const dpr = Math.min(2, window.devicePixelRatio || 1);
+        const vp = page.getViewport({ scale: renderScale * dpr });
+        sheetCanvas.width = Math.round(vp.width);
+        sheetCanvas.height = Math.round(vp.height);
+        await page.render({ canvasContext: sheetCanvas.getContext('2d'), viewport: vp }).promise;
+        const turned = displayedPage !== -1 && displayedPage !== num;
+        displayedPage = num;
+        if (sheetPageInfo) sheetPageInfo.textContent = `Page ${num} / ${pdfDoc.numPages}`;
+        if (sheetPrev) sheetPrev.disabled = num <= 1;
+        if (sheetNext) sheetNext.disabled = num >= pdfDoc.numPages;
+        syncArrows();
+        // Turning a page from halfway down leaves you looking at the middle of
+        // the next one; bring its top back into view.
+        if (turned) {
+          const smooth = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+          sheetSection.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'start' });
+        }
+      } finally {
+        pdfRendering = false;
+        if (queuedPage !== null) {
+          const next = queuedPage; queuedPage = null;
+          if (next !== displayedPage) { displayedPage = -1; renderPage(next); }
+        }
+      }
+    }
+
+    if (sheetToggle) {
+      sheetToggle.addEventListener('click', async () => {
+        const open = sheetSection.style.display === 'none';
+        sheetSection.style.display = open ? '' : 'none';
+        sheetToggle.textContent = open ? '📄 Hide Score' : '📄 Score';
+        sheetToggle.setAttribute('aria-expanded', String(open));
+        if (open) {
+          innerEl.classList.add('pp-score-open');
+          if (resourceList) resourceList.classList.remove('overflow-hidden');
+          const target = Math.max(1, displayedPage);
+          displayedPage = -1; // force re-render at the new layout width
+          await renderPage(target);
+        } else {
+          innerEl.classList.remove('pp-score-open');
+          if (resourceList) resourceList.classList.add('overflow-hidden');
+        }
+      });
+      sheetPrev.addEventListener('click', () => renderPage(targetPage - 1));
+      sheetNext.addEventListener('click', () => renderPage(targetPage + 1));
+    }
+
+    // ---- Entry point for the rehearsal schedule's practice links ----
+    // Open this row and loop one measure range, the same call MidiPractice
+    // registers. Only offered where the song has a measure grid to loop by.
+    async function practiceMeasures(from, to) {
+      if (!hasGrid) return;
+      unlockAudio();
+      await openPlayer();
+      if (!loaded) return;
+      const last = totalMeasures || Infinity;
+      const a = Math.max(1, Math.min(Math.round(from), last));
+      const b = Math.max(a, Math.min(Math.round(to), last));
+      // from < 1 is the schedule's "to m 32": from the very start. That is the
+      // start of the recording, pickup beats and all, not the downbeat of m. 1.
+      const start = from < 1 ? 0 : barStartSec(a);
+      loopStart = Math.max(0, Math.min(start, duration - minGap));
+      loopEnd = Math.max(loopStart + minGap, Math.min(barStartSec(b + 1), duration));
+      punchArmed = false;
+      loopEnabled = true;
+      updateLoopMarkers();
+      renderLoopUI();
+      seek(loopStart);
+      if (!isPlaying) play();
+    }
+    if (hasGrid) practiceJumps[prefix] = practiceMeasures;
+
+    // ---- "Download Mix": render the current settings to an MP3 ----
+    // The MIDI players rebuild their piano inside an OfflineAudioContext. Here
+    // the same idea is cheaper: the parts are already decoded buffers, so the
+    // render is the same graph the speakers get, run offline as fast as the
+    // machine can manage.
+    const EXPORT_RATE = 44100;   // lamejs takes 32/44.1/48 kHz only
+    const EXPORT_KBPS = 128;
+    const EXPORT_TAIL = 1.5;     // let the last chord ring out
+
+    let exportBarFill = null, exportTextEl = null, exportBarEl = null, exportSpinEl = null, exportCloseEl = null;
+    let exportClearTimer = null;
+    function setExportStatus(text, pct, cls, busy) {
+      clearTimeout(exportClearTimer);
+      exportStatus.hidden = false;
+      exportStatus.className = 'pp-export-status' + (cls ? ' ' + cls : '');
+      if (!exportTextEl) {
+        exportSpinEl = document.createElement('span');
+        exportSpinEl.className = 'note-spin';
+        exportSpinEl.setAttribute('aria-hidden', 'true');
+        exportSpinEl.textContent = '🎵';
+        exportTextEl = document.createElement('span');
+        const bar = document.createElement('div');
+        bar.className = 'pp-export-bar';
+        exportBarFill = document.createElement('i');
+        bar.appendChild(exportBarFill);
+        exportCloseEl = document.createElement('button');
+        exportCloseEl.type = 'button';
+        exportCloseEl.className = 'pp-export-close';
+        exportCloseEl.setAttribute('aria-label', 'Dismiss this message');
+        exportCloseEl.textContent = '×';
+        exportCloseEl.addEventListener('click', () => {
+          clearTimeout(exportClearTimer);
+          exportStatus.hidden = true;
+        });
+        exportStatus.append(exportSpinEl, exportTextEl, bar, exportCloseEl);
+        exportBarEl = bar;
+      }
+      exportSpinEl.hidden = !busy;
+      exportCloseEl.hidden = !!busy;
+      exportTextEl.textContent = text;
+      exportBarEl.style.display = pct == null ? 'none' : '';
+      if (pct != null) exportBarFill.style.width = `${Math.round(pct * 100)}%`;
+      if (cls === 'is-done') exportClearTimer = setTimeout(() => { exportStatus.hidden = true; }, 12000);
+    }
+
+    // Filename says what is in the file: song, focused part, tempo, measures.
+    function exportFilename() {
+      const slug = t => String(t || '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '');
+      const bits = [slug(song.title) || 'practice-mix'];
+      if (focusedTrack !== null) bits.push(slug(song.parts[focusedTrack].label));
+      if (playbackRate !== 1) bits.push(`${Math.round(playbackRate * 100)}pct`);
+      if (loopEnabled && loopEnd > loopStart && hasGrid) {
+        bits.push(`m${measureAt(loopStart)}-${measureAt(Math.max(loopStart, loopEnd - 0.01))}`);
+      }
+      return bits.join('-').slice(0, 90) + '.mp3';
+    }
+
+    async function renderMix() {
+      const gains = currentGains();
+      const useLoop = loopEnabled && loopEnd > loopStart;
+      const startSec = useLoop ? loopStart : 0;
+      const endSec = useLoop ? loopEnd : duration;
+      const rate = playbackRate || 1;
+      const totalSec = (endSec - startSec) / rate + EXPORT_TAIL;
+      const ctx = new OfflineAudioContext(2, Math.ceil(totalSec * EXPORT_RATE), EXPORT_RATE);
+
+      // Pitch-preserving slow-down needs the worklet in THIS context, not the
+      // live one. If it will not load, the export runs at full speed rather
+      // than handing back a file a semitone flat.
+      let stretch = false;
+      if (Math.abs(rate - 1) > 0.004) {
+        try {
+          // loadSoundTouch() registers the worklet on the LIVE context, so do
+          // the import here and register it on this one.
+          if (!_stMod) {
+            const mod: any = await import('@soundtouchjs/audio-worklet');
+            _stMod = mod.SoundTouchNode ? mod : (mod.default || mod);
+          }
+          await ctx.audioWorklet.addModule('/soundtouch-processor.js');
+          stretch = true;
+        } catch (e) {
+          console.error('[audio export] SoundTouch unavailable offline', e);
+        }
+      }
+
+      buffers.forEach((buf, i) => {
+        if (gains[i] <= 0) return;               // a muted part costs nothing
+        const g = ctx.createGain();
+        g.gain.value = gains[i];
+        g.connect(ctx.destination);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        if (stretch) {
+          src.playbackRate.value = rate;
+          const st = new _stMod.SoundTouchNode({ context: ctx });
+          st.playbackRate.value = rate;
+          src.connect(st); st.connect(g);
+        } else {
+          src.connect(g);
+        }
+        src.start(0, startSec, Math.max(0.01, endSec - startSec));
+      });
+
+      if (metronomeOn && metroLevel > 0 && METRO_BPM) {
+        const level = metroGain(metroLevel);
+        const secPerBeat = (60 / METRO_BPM) / rate;
+        const firstBeat = Math.ceil(secToBeat(startSec) - 1e-6);
+        for (let k = 0; ; k++) {
+          const beatIdx = firstBeat + k;
+          const when = (beatToSec(beatIdx) - startSec) / rate;
+          if (when >= totalSec - EXPORT_TAIL) break;
+          if (when < 0) continue;
+          const accent = isDownbeat(beatIdx);
+          const osc = ctx.createOscillator(), gn = ctx.createGain();
+          osc.frequency.value = accent ? 1600 : 1000;
+          gn.gain.setValueAtTime(0.0001, when);
+          gn.gain.exponentialRampToValueAtTime((accent ? 0.5 : 0.28) * level, when + 0.002);
+          gn.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+          osc.connect(gn); gn.connect(ctx.destination);
+          osc.start(when); osc.stop(when + 0.06);
+          if (secPerBeat <= 0) break;
+        }
+      }
+
+      return ctx.startRendering();
+    }
+
+    const toPcm = v => { const c = v < -1 ? -1 : v > 1 ? 1 : v; return c < 0 ? c * 0x8000 : c * 0x7fff; };
+
+    async function encodeMp3(audio, onProgress) {
+      const { Mp3Encoder } = await import('@breezystack/lamejs');
+      const enc = new Mp3Encoder(2, audio.sampleRate, EXPORT_KBPS);
+      const L = audio.getChannelData(0);
+      const R = audio.numberOfChannels > 1 ? audio.getChannelData(1) : L;
+      const BLOCK = 1152;                 // one MP3 frame
+      const li = new Int16Array(BLOCK), ri = new Int16Array(BLOCK);
+      const parts = [];
+      for (let off = 0, block = 0; off < L.length; off += BLOCK, block++) {
+        const n = Math.min(BLOCK, L.length - off);
+        for (let j = 0; j < n; j++) { li[j] = toPcm(L[off + j]); ri[j] = toPcm(R[off + j]); }
+        const chunk = n === BLOCK
+          ? enc.encodeBuffer(li, ri)
+          : enc.encodeBuffer(li.subarray(0, n), ri.subarray(0, n));
+        if (chunk.length) parts.push(new Uint8Array(chunk));
+        // Hand the main thread back every ~5 seconds of audio so the bar paints
+        // and the page keeps answering taps on a phone.
+        if (block % 200 === 199) {
+          onProgress(off / L.length);
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+      const tail = enc.flush();
+      if (tail.length) parts.push(new Uint8Array(tail));
+      return new Blob(parts, { type: 'audio/mpeg' });
+    }
+
+    exportBtn.addEventListener('click', async () => {
+      if (!loaded || exportBtn.disabled) return;
+      if (isPlaying) pausePlayback();
+      if (currentGains().every(g => g <= 0) && !(metronomeOn && metroLevel > 0)) {
+        setExportStatus('Turn up at least one part before you save.', null, 'is-error');
+        return;
+      }
+      exportBtn.disabled = true;
+      try {
+        setExportStatus('Mixing the parts…', null, null, true);
+        const audio = await renderMix();
+        setExportStatus('Making the MP3…', 0, null, true);
+        const blob = await encodeMp3(audio, pct => setExportStatus('Making the MP3…', pct, null, true));
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = exportFilename();
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+        const mb = (blob.size / 1048576).toFixed(1);
+        setExportStatus(`Saved ${a.download} (${mb} MB). Look in your Downloads.`, null, 'is-done', false);
+      } catch (e) {
+        console.error('[audio-practice] export failed', e);
+        setExportStatus('The save failed. Reload the page and try again.', null, 'is-error', false);
+      } finally {
+        exportBtn.disabled = false;
+      }
+    });
+  }
+
+  document.querySelectorAll('.audio-practice').forEach((el) => {
+    const node = el as HTMLElement;
+    const cfg = node.dataset.audioConfig;
+    const prefix = node.dataset.prefix;
+    if (!cfg || !prefix) return;
+    makeAudioPlayer(prefix, JSON.parse(cfg));
+  });
+</script>
